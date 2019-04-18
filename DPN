@@ -1,0 +1,116 @@
+import os
+import skimage
+from skimage import io, transform
+import math
+import keras
+import numpy as np
+import tensorflow as tf
+from keras import layers
+from keras.layers import Input, Add, Dense, Activation, ZeroPadding2D,Lambda,add,concatenate, BatchNormalization,GlobalAveragePooling2D, Flatten, Conv2D, AveragePooling2D, MaxPooling2D, GlobalMaxPooling2D
+from keras.models import Model, load_model
+from keras.preprocessing import image
+from keras.utils import layer_utils
+from keras.utils.data_utils import get_file
+from keras.applications.imagenet_utils import preprocess_input
+import pydot
+from IPython.display import SVG
+from keras.utils.vis_utils import model_to_dot
+from keras.utils import plot_model
+from keras.initializers import glorot_uniform
+import scipy.misc
+from matplotlib.pyplot import imshow
+from keras.regularizers import l2
+%matplotlib inline
+
+import keras.backend as K
+K.set_learning_phase(1)
+
+def grouped_convolution_block(input_g, filters_g, cardinality_g):
+    group_list = []
+    grouped_channels = filters_g//cardinality_g
+    for c in range(cardinality_g):
+        X = Lambda(lambda z: z[:, :, :, c * grouped_channels:(c + 1) * grouped_channels])(input_g)
+        X = Conv2D(grouped_channels, (3, 3), padding='same', use_bias=False, kernel_initializer='he_normal', kernel_regularizer=l2(5e-4))(X)
+        group_list.append(X)
+    group_merge = concatenate(group_list, axis=-1)
+    X = BatchNormalization(axis=-1)(group_merge)
+    X = Activation('relu')(X)
+    return X
+    
+def DPN_block(input_b, filters_b, cardinality_b=32, strides_b = 1, inc_b= 16, conv_block='FALSE'):
+    F1, F2, F3 = filters_b
+    grouped_channels = F2/cardinality_b
+    
+    if conv_block == 'TRUE':
+        X_shortcut = Conv2D(F3, (1,1), padding='same', strides=(strides_b, strides_b),use_bias=False, kernel_initializer='he_normal', kernel_regularizer=l2(5e-4))(input_b)
+        X_shortcut = BatchNormalization(axis=-1)(X_shortcut)
+    else:
+        X_shortcut = input_b
+        
+    X1 = Lambda(lambda z: z[:, :, :, :F3])(X_shortcut)
+    X2 = Lambda(lambda z: z[:, :, :, F3:])(X_shortcut)
+    
+    X = Conv2D(F1, kernel_size=(1, 1), strides=(strides_b, strides_b), padding='same', use_bias=False, kernel_initializer='he_normal', kernel_regularizer=l2(5e-4))(input_b)
+    X = BatchNormalization(axis=-1)(X)
+    X = Activation('relu')(X)
+
+    X = grouped_convolution_block(X, F2, cardinality_b)
+
+    X = Conv2D(F3 + inc_b, (1, 1), padding='same', use_bias=False, kernel_initializer='he_normal', kernel_regularizer=l2(5e-4))(X)
+    X = BatchNormalization(axis=-1)(X)
+
+    X1 = add([Lambda(lambda z: z[:, :, :,:F3])(X), X1])
+    X2 = concatenate([X2, Lambda(lambda z: z[:, :, :,F3:])(X)],axis = -1)
+    X = concatenate([X1,X2],axis=-1)
+    X = Activation('relu')(X)
+
+    return X
+   
+# filter_increment: number of filters incremented per block, defined as a list.
+#     DPN-92  = [16, 32, 24, 128]
+#     DON-98  = [16, 32, 32, 128]
+#     DPN-131 = [16, 32, 32, 128]
+#     DPN-107 = [20, 64, 64, 128]
+# depth: number or layers in the each block, defined as a list.
+#     DPN-92  = [3, 4, 20, 3]
+#     DPN-98  = [3, 6, 20, 3]
+#     DPN-131 = [4, 8, 28, 3]
+#     DPN-107 = [4, 8, 20, 3]
+
+def DPN(input_shape = (224, 224,3), depth=[4, 8, 28, 3], inc= [16, 32, 32, 128], first_block_filters= [160,160,256], cardinality=40):
+    X_input = Input(input_shape)
+    X = Conv2D(128, (7, 7), padding='same', use_bias=False, strides=(2, 2), kernel_initializer='he_normal', kernel_regularizer=l2(5e-4))(X_input)
+    X = BatchNormalization(axis=-1)(X)
+    X = Activation('relu')(X)
+    X = MaxPooling2D((3, 3), strides=(2, 2), padding='same')(X)
+    
+    multiplier = [2,2,2]
+    X = DPN_block(X, first_block_filters, cardinality, strides_b = 1, inc_b= inc[0], conv_block='TRUE')
+    for i in np.arange(depth[0]-1):
+        X = DPN_block(X, first_block_filters, cardinality, strides_b = 1, inc_b= inc[0], conv_block='FALSE')
+        
+    first_block_filters=[a*b for a, b in zip(multiplier,first_block_filters)]
+    depth = depth[1:]
+    inc = inc[1:]
+    
+    for blockid, n_i in enumerate(depth):
+        for i in range(n_i):
+            if i == 0:
+                X = DPN_block(X, first_block_filters, cardinality, strides_b = 2, inc_b= inc[blockid], conv_block='TRUE')
+            else:
+                X = DPN_block(X, first_block_filters, cardinality, strides_b = 1, inc_b= inc[blockid], conv_block='FALSE')
+        first_block_filters=[a*b for a, b in zip(multiplier,first_block_filters)]
+            
+    a = GlobalMaxPooling2D()(X)
+    b = GlobalAveragePooling2D()(X)
+    X = add([a, b])
+    X = Lambda(lambda z: 0.5 * z)(X)
+    X = Dense(2, use_bias=False, activation='softmax')(X)
+    model = Model(inputs = X_input, outputs = X, name='DPN')
+
+    return model
+    
+model = DPN(input_shape = (224, 224,3))
+model.summary()
+model.compile(optimizer=keras.optimizers.Adam(lr=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0), loss='categorical_crossentropy', metrics=['accuracy'])
+model.fit(x_train, y_train,epochs = 900, batch_size=32,validation_data=(x_test,y_test), shuffle = True)
